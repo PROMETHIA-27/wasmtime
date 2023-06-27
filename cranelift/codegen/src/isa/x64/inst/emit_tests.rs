@@ -87,14 +87,14 @@ impl Inst {
         }
     }
 
-    fn xmm_rm_r_evex(op: Avx512Opcode, src1: RegMem, src2: Reg, dst: Writable<Reg>) -> Self {
-        src1.assert_regclass_is(RegClass::Float);
-        debug_assert!(src2.class() == RegClass::Float);
+    fn xmm_rm_r_evex(op: Avx512Opcode, src1: Reg, src2: RegMem, dst: Writable<Reg>) -> Self {
+        src2.assert_regclass_is(RegClass::Float);
+        debug_assert!(src1.class() == RegClass::Float);
         debug_assert!(dst.to_reg().class() == RegClass::Float);
         Inst::XmmRmREvex {
             op,
-            src1: XmmMem::new(src1).unwrap(),
-            src2: Xmm::new(src2).unwrap(),
+            src1: Xmm::new(src1).unwrap(),
+            src2: XmmMem::new(src2).unwrap(),
             dst: WritableXmm::from_writable_reg(dst).unwrap(),
         }
     }
@@ -4335,6 +4335,8 @@ fn test_x64_emit() {
             smallvec![],
             PRegSet::default(),
             Opcode::Call,
+            0,
+            CallConv::SystemV,
         ),
         "E800000000",
         "call    User(userextname0)",
@@ -4349,6 +4351,8 @@ fn test_x64_emit() {
             smallvec![],
             PRegSet::default(),
             Opcode::CallIndirect,
+            0,
+            CallConv::SystemV,
         )
     }
 
@@ -4411,7 +4415,8 @@ fn test_x64_emit() {
 
     // ========================================================
     // Ret
-    insns.push((Inst::ret(vec![]), "C3", "ret"));
+    insns.push((Inst::ret(vec![], 0), "C3", "ret"));
+    insns.push((Inst::ret(vec![], 8), "C20800", "ret 8"));
 
     // ========================================================
     // JmpKnown skipped for now
@@ -4776,21 +4781,21 @@ fn test_x64_emit() {
     ));
 
     insns.push((
-        Inst::xmm_rm_r_evex(Avx512Opcode::Vpmullq, RegMem::reg(xmm14), xmm10, w_xmm1),
+        Inst::xmm_rm_r_evex(Avx512Opcode::Vpmullq, xmm10, RegMem::reg(xmm14), w_xmm1),
         "62D2AD0840CE",
-        "vpmullq %xmm14, %xmm10, %xmm1",
+        "vpmullq %xmm10, %xmm14, %xmm1",
     ));
 
     insns.push((
-        Inst::xmm_rm_r_evex(Avx512Opcode::Vpermi2b, RegMem::reg(xmm14), xmm10, w_xmm1),
+        Inst::xmm_rm_r_evex(Avx512Opcode::Vpermi2b, xmm10, RegMem::reg(xmm14), w_xmm1),
         "62D22D0875CE",
-        "vpermi2b %xmm14, %xmm10, %xmm1",
+        "vpermi2b %xmm10, %xmm14, %xmm1",
     ));
 
     insns.push((
-        Inst::xmm_rm_r_evex(Avx512Opcode::Vpermi2b, RegMem::reg(xmm1), xmm0, w_xmm2),
+        Inst::xmm_rm_r_evex(Avx512Opcode::Vpermi2b, xmm0, RegMem::reg(xmm1), w_xmm2),
         "62F27D0875D1",
-        "vpermi2b %xmm1, %xmm0, %xmm2",
+        "vpermi2b %xmm0, %xmm1, %xmm2",
     ));
 
     insns.push((

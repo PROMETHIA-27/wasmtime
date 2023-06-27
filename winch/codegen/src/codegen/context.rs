@@ -1,4 +1,5 @@
 use crate::{
+    abi::ABIResult,
     frame::Frame,
     masm::{MacroAssembler, OperandSize, RegImm},
     reg::Reg,
@@ -29,6 +30,8 @@ pub(crate) struct CodeGenContext<'a> {
     pub stack: Stack,
     /// The current function's frame.
     pub frame: &'a Frame,
+    /// Reachability state.
+    pub reachable: bool,
 }
 
 impl<'a> CodeGenContext<'a> {
@@ -38,6 +41,7 @@ impl<'a> CodeGenContext<'a> {
             regalloc,
             stack,
             frame,
+            reachable: true,
         }
     }
 
@@ -45,7 +49,7 @@ impl<'a> CodeGenContext<'a> {
     /// spilling if not available.
     pub fn gpr<M: MacroAssembler>(&mut self, named: Reg, masm: &mut M) -> Reg {
         self.regalloc.gpr(named, &mut |regalloc| {
-            Self::spill(&mut self.stack, regalloc, &self.frame, masm)
+            Self::spill_impl(&mut self.stack, regalloc, &self.frame, masm)
         })
     }
 
@@ -53,7 +57,7 @@ impl<'a> CodeGenContext<'a> {
     /// spilling if no registers are available.
     pub fn any_gpr<M: MacroAssembler>(&mut self, masm: &mut M) -> Reg {
         self.regalloc
-            .any_gpr(&mut |regalloc| Self::spill(&mut self.stack, regalloc, &self.frame, masm))
+            .any_gpr(&mut |regalloc| Self::spill_impl(&mut self.stack, regalloc, &self.frame, masm))
     }
 
     /// Free the given general purpose register.
@@ -65,6 +69,9 @@ impl<'a> CodeGenContext<'a> {
     /// it isn't already one; spilling if there are no registers
     /// available.  Optionally the caller may specify a specific
     /// destination register.
+    /// When a named register is requested and it's not at the top of the
+    /// stack a move from register to register might happen, in which case
+    /// the source register will be freed.
     pub fn pop_to_reg<M: MacroAssembler>(
         &mut self,
         masm: &mut M,
@@ -92,6 +99,10 @@ impl<'a> CodeGenContext<'a> {
             masm.pop(dst);
         } else {
             self.move_val_to_reg(&val, dst, masm, size);
+            // Free the source value if it is a register.
+            if val.is_reg() {
+                self.regalloc.free_gpr(val.get_reg());
+            }
         }
 
         dst
@@ -121,11 +132,22 @@ impl<'a> CodeGenContext<'a> {
                 let addr = masm.address_from_sp(*offset);
                 masm.load(addr, dst, size);
             }
-        };
+        }
+    }
+
+    /// Prepares arguments for emitting a unary operation.
+    pub fn unop<F, M>(&mut self, masm: &mut M, size: OperandSize, emit: &mut F)
+    where
+        F: FnMut(&mut M, Reg, OperandSize),
+        M: MacroAssembler,
+    {
+        let reg = self.pop_to_reg(masm, None, size);
+        emit(masm, reg, size);
+        self.stack.push(Val::reg(reg));
     }
 
     /// Prepares arguments for emitting an i32 binary operation.
-    pub fn i32_binop<F, M>(&mut self, masm: &mut M, emit: &mut F)
+    pub fn i32_binop<F, M>(&mut self, masm: &mut M, mut emit: F)
     where
         F: FnMut(&mut M, RegImm, RegImm, OperandSize),
         M: MacroAssembler,
@@ -155,7 +177,7 @@ impl<'a> CodeGenContext<'a> {
     }
 
     /// Prepares arguments for emitting an i64 binary operation.
-    pub fn i64_binop<F, M>(&mut self, masm: &mut M, emit: &mut F)
+    pub fn i64_binop<F, M>(&mut self, masm: &mut M, mut emit: F)
     where
         F: FnMut(&mut M, RegImm, RegImm, OperandSize),
         M: MacroAssembler,
@@ -224,6 +246,55 @@ impl<'a> CodeGenContext<'a> {
         self.stack.inner_mut().truncate(truncate);
     }
 
+    /// Reset value and stack pointer to the given length
+    /// and stack pointer offset respectively.
+    pub fn reset_stack<M: MacroAssembler>(
+        &mut self,
+        masm: &mut M,
+        stack_len: usize,
+        sp_offset: u32,
+    ) {
+        masm.reset_stack_pointer(sp_offset);
+        self.drop_last(self.stack.len() - stack_len);
+    }
+
+    /// Convenience wrapper around [`Self::spill_callback`].
+    ///
+    /// This function exists for cases in which triggering an unconditional
+    /// spill is needed, like before entering control flow.
+    pub fn spill<M: MacroAssembler>(&mut self, masm: &mut M) {
+        Self::spill_impl(&mut self.stack, &mut self.regalloc, &mut self.frame, masm);
+    }
+
+    /// Handles the emission of the ABI result. This function is used at the end
+    /// of a block or function to pop the results from the value stack into the
+    /// corresponding ABI result representation.
+    pub fn pop_abi_results<M: MacroAssembler>(&mut self, result: &ABIResult, masm: &mut M) {
+        if result.is_void() {
+            return;
+        }
+
+        let reg = self.pop_to_reg(masm, Some(result.result_reg()), OperandSize::S64);
+        self.regalloc.free_gpr(reg);
+    }
+
+    /// Push ABI results in to the value stack. This function is used at the end
+    /// of a block or after a function call to push the corresponding ABI
+    /// results into the value stack.
+    pub fn push_abi_results<M: MacroAssembler>(&mut self, result: &ABIResult, masm: &mut M) {
+        if result.is_void() {
+            return;
+        }
+
+        match result {
+            ABIResult::Reg { reg, .. } => {
+                assert!(self.regalloc.gpr_available(*reg));
+                let result_reg = Val::reg(self.gpr(*reg, masm));
+                self.stack.push(result_reg);
+            }
+        }
+    }
+
     /// Spill locals and registers to memory.
     // TODO optimize the spill range;
     //
@@ -232,7 +303,7 @@ impl<'a> CodeGenContext<'a> {
     // we could effectively ignore that range;
     // only focusing on the range that contains
     // spillable values.
-    fn spill<M: MacroAssembler>(
+    fn spill_impl<M: MacroAssembler>(
         stack: &mut Stack,
         regalloc: &mut RegAlloc,
         frame: &Frame,
@@ -251,9 +322,7 @@ impl<'a> CodeGenContext<'a> {
                 let offset = masm.push(regalloc.scratch);
                 *v = Val::Memory(offset);
             }
-            v => {
-                println!("trying to spill something unknown {:?}", v);
-            }
+            _ => {}
         });
     }
 }

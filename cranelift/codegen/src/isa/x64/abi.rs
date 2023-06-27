@@ -44,17 +44,32 @@ impl X64ABIMachineSpec {
             ));
         }
     }
-    fn gen_probestack_loop(insts: &mut SmallInstVec<Inst>, frame_size: u32, guard_size: u32) {
-        // We have to use a caller saved register since clobbering only happens
-        // after stack probing.
-        //
-        // R11 is caller saved on both Fastcall and SystemV, and not used for argument
-        // passing, so it's pretty much free. It is also not used by the stacklimit mechanism.
-        let tmp = regs::r11();
-        debug_assert!({
-            let real_reg = tmp.to_real_reg().unwrap();
-            !is_callee_save_systemv(real_reg, false) && !is_callee_save_fastcall(real_reg, false)
-        });
+
+    fn gen_probestack_loop(
+        insts: &mut SmallInstVec<Inst>,
+        call_conv: isa::CallConv,
+        frame_size: u32,
+        guard_size: u32,
+    ) {
+        // We have to use a caller-saved register since clobbering only
+        // happens after stack probing.
+        let tmp = match call_conv {
+            // All registers are caller-saved on the `tail` calling convention,
+            // and `r15` is not used to pass arguments.
+            isa::CallConv::Tail => regs::r15(),
+            // `r11` is caller saved on both Fastcall and SystemV, and not used
+            // for argument passing, so it's pretty much free. It is also not
+            // used by the stacklimit mechanism.
+            _ => {
+                let tmp = regs::r11();
+                debug_assert!({
+                    let real_reg = tmp.to_real_reg().unwrap();
+                    !is_callee_save_systemv(real_reg, false)
+                        && !is_callee_save_fastcall(real_reg, false)
+                });
+                tmp
+            }
+        };
 
         insts.push(Inst::StackProbeLoop {
             tmp: Writable::from_reg(tmp),
@@ -154,6 +169,44 @@ impl ABIMachineSpec for X64ABIMachineSpec {
                 );
             }
 
+            // Windows fastcall dictates that `__m128i` paramters to a function
+            // are passed indirectly as pointers, so handle that as a special
+            // case before the loop below.
+            if param.value_type.is_vector()
+                && param.value_type.bits() >= 128
+                && args_or_rets == ArgsOrRets::Args
+                && is_fastcall
+            {
+                let pointer = match get_intreg_for_arg(&call_conv, next_gpr, next_param_idx) {
+                    Some(reg) => {
+                        next_gpr += 1;
+                        ABIArgSlot::Reg {
+                            reg: reg.to_real_reg().unwrap(),
+                            ty: ir::types::I64,
+                            extension: ir::ArgumentExtension::None,
+                        }
+                    }
+
+                    None => {
+                        next_stack = align_to(next_stack, 8) + 8;
+                        ABIArgSlot::Stack {
+                            offset: (next_stack - 8) as i64,
+                            ty: ir::types::I64,
+                            extension: param.extension,
+                        }
+                    }
+                };
+                next_param_idx += 1;
+                args.push(ABIArg::ImplicitPtrArg {
+                    // NB: this is filled in after this loop
+                    offset: 0,
+                    pointer,
+                    ty: param.value_type,
+                    purpose: param.purpose,
+                });
+                continue;
+            }
+
             let mut slots = ABIArgSlotVec::new();
             for (rc, reg_ty) in rcs.iter().zip(reg_tys.iter()) {
                 let intreg = *rc == RegClass::Int;
@@ -221,17 +274,31 @@ impl ABIMachineSpec for X64ABIMachineSpec {
             });
         }
 
+        // Fastcall's indirect 128+ bit vector arguments are all located on the
+        // stack, and stack space is reserved after all paramters are passed,
+        // so allocate from the space now.
+        if args_or_rets == ArgsOrRets::Args && is_fastcall {
+            for arg in args.args_mut() {
+                if let ABIArg::ImplicitPtrArg { offset, .. } = arg {
+                    assert_eq!(*offset, 0);
+                    next_stack = align_to(next_stack, 16);
+                    *offset = next_stack as i64;
+                    next_stack += 16;
+                }
+            }
+        }
+
         let extra_arg = if add_ret_area_ptr {
             debug_assert!(args_or_rets == ArgsOrRets::Args);
             if let Some(reg) = get_intreg_for_arg(&call_conv, next_gpr, next_param_idx) {
-                args.push(ABIArg::reg(
+                args.push_non_formal(ABIArg::reg(
                     reg.to_real_reg().unwrap(),
                     types::I64,
                     ir::ArgumentExtension::None,
                     ir::ArgumentPurpose::Normal,
                 ));
             } else {
-                args.push(ABIArg::stack(
+                args.push_non_formal(ABIArg::stack(
                     next_stack as i64,
                     types::I64,
                     ir::ArgumentExtension::None,
@@ -301,8 +368,9 @@ impl ABIMachineSpec for X64ABIMachineSpec {
         _setup_frame: bool,
         _isa_flags: &x64_settings::Flags,
         rets: Vec<RetPair>,
+        stack_bytes_to_pop: u32,
     ) -> Self::I {
-        Inst::ret(rets)
+        Inst::ret(rets, stack_bytes_to_pop)
     }
 
     fn gen_add_imm(into_reg: Writable<Reg>, from_reg: Reg, imm: u32) -> SmallInstVec<Self::I> {
@@ -347,8 +415,9 @@ impl ABIMachineSpec for X64ABIMachineSpec {
     }
 
     fn gen_load_base_offset(into_reg: Writable<Reg>, base: Reg, offset: i32, ty: Type) -> Self::I {
-        // Only ever used for I64s; if that changes, see if the ExtKind below needs to be changed.
-        assert_eq!(ty, I64);
+        // Only ever used for I64s and vectors; if that changes, see if the
+        // ExtKind below needs to be changed.
+        assert!(ty == I64 || ty.is_vector());
         let simm32 = offset as u32;
         let mem = Amode::imm_reg(simm32, base);
         Inst::load(ty, mem, into_reg, ExtKind::None)
@@ -434,11 +503,18 @@ impl ABIMachineSpec for X64ABIMachineSpec {
                 defs: smallvec![],
                 clobbers: PRegSet::empty(),
                 opcode: Opcode::Call,
+                callee_pop_size: 0,
+                callee_conv: CallConv::Probestack,
             }),
         });
     }
 
-    fn gen_inline_probestack(insts: &mut SmallInstVec<Self::I>, frame_size: u32, guard_size: u32) {
+    fn gen_inline_probestack(
+        insts: &mut SmallInstVec<Self::I>,
+        call_conv: isa::CallConv,
+        frame_size: u32,
+        guard_size: u32,
+    ) {
         // Unroll at most n consecutive probes, before falling back to using a loop
         //
         // This was number was picked because the loop version is 38 bytes long. We can fit
@@ -451,18 +527,22 @@ impl ABIMachineSpec for X64ABIMachineSpec {
         if probe_count <= PROBE_MAX_UNROLL {
             Self::gen_probestack_unroll(insts, guard_size, probe_count)
         } else {
-            Self::gen_probestack_loop(insts, frame_size, guard_size)
+            Self::gen_probestack_loop(insts, call_conv, frame_size, guard_size)
         }
     }
 
     fn gen_clobber_save(
-        _call_conv: isa::CallConv,
+        call_conv: isa::CallConv,
         setup_frame: bool,
         flags: &settings::Flags,
         clobbered_callee_saves: &[Writable<RealReg>],
         fixed_frame_storage_size: u32,
         _outgoing_args_size: u32,
     ) -> (u64, SmallVec<[Self::I; 16]>) {
+        if call_conv == isa::CallConv::Tail {
+            assert!(clobbered_callee_saves.is_empty());
+        }
+
         let mut insts = SmallVec::new();
         let clobbered_size = compute_clobber_size(&clobbered_callee_saves);
 
@@ -591,13 +671,22 @@ impl ABIMachineSpec for X64ABIMachineSpec {
         clobbers: PRegSet,
         opcode: ir::Opcode,
         tmp: Writable<Reg>,
-        _callee_conv: isa::CallConv,
+        callee_conv: isa::CallConv,
         _caller_conv: isa::CallConv,
+        callee_pop_size: u32,
     ) -> SmallVec<[Self::I; 2]> {
         let mut insts = SmallVec::new();
         match dest {
             &CallDest::ExtName(ref name, RelocDistance::Near) => {
-                insts.push(Inst::call_known(name.clone(), uses, defs, clobbers, opcode));
+                insts.push(Inst::call_known(
+                    name.clone(),
+                    uses,
+                    defs,
+                    clobbers,
+                    opcode,
+                    callee_pop_size,
+                    callee_conv,
+                ));
             }
             &CallDest::ExtName(ref name, RelocDistance::Far) => {
                 insts.push(Inst::LoadExtName {
@@ -612,6 +701,8 @@ impl ABIMachineSpec for X64ABIMachineSpec {
                     defs,
                     clobbers,
                     opcode,
+                    callee_pop_size,
+                    callee_conv,
                 ));
             }
             &CallDest::Reg(reg) => {
@@ -621,10 +712,58 @@ impl ABIMachineSpec for X64ABIMachineSpec {
                     defs,
                     clobbers,
                     opcode,
+                    callee_pop_size,
+                    callee_conv,
                 ));
             }
         }
         insts
+    }
+
+    fn gen_return_call(
+        callee: CallDest,
+        new_stack_arg_size: u32,
+        old_stack_arg_size: u32,
+        ret_addr: Option<Reg>,
+        fp: Reg,
+        tmp: Writable<Reg>,
+        tmp2: Writable<Reg>,
+        uses: abi::CallArgList,
+    ) -> SmallVec<[Self::I; 2]> {
+        let ret_addr = ret_addr.map(|r| Gpr::new(r).unwrap());
+        let fp = Gpr::new(fp).unwrap();
+        let tmp = WritableGpr::from_writable_reg(tmp).unwrap();
+        let info = Box::new(ReturnCallInfo {
+            new_stack_arg_size,
+            old_stack_arg_size,
+            ret_addr,
+            fp,
+            tmp,
+            uses,
+        });
+        match callee {
+            CallDest::ExtName(callee, RelocDistance::Near) => {
+                smallvec![Inst::ReturnCallKnown { callee, info }]
+            }
+            CallDest::ExtName(callee, RelocDistance::Far) => {
+                smallvec![
+                    Inst::LoadExtName {
+                        dst: tmp2,
+                        name: Box::new(callee.clone()),
+                        offset: 0,
+                        distance: RelocDistance::Far,
+                    },
+                    Inst::ReturnCallUnknown {
+                        callee: tmp2.into(),
+                        info,
+                    }
+                ]
+            }
+            CallDest::Reg(callee) => smallvec![Inst::ReturnCallUnknown {
+                callee: callee.into(),
+                info,
+            }],
+        }
     }
 
     fn gen_memcpy<F: FnMut(Type) -> Writable<Reg>>(
@@ -650,6 +789,7 @@ impl ABIMachineSpec for X64ABIMachineSpec {
             offset: 0,
             distance: RelocDistance::Far,
         });
+        let callee_pop_size = 0;
         insts.push(Inst::call_unknown(
             RegMem::reg(temp2.to_reg()),
             /* uses = */
@@ -670,6 +810,8 @@ impl ABIMachineSpec for X64ABIMachineSpec {
             /* defs = */ smallvec![],
             /* clobbers = */ Self::get_regs_clobbered_by_call(call_conv),
             Opcode::Call,
+            callee_pop_size,
+            call_conv,
         ));
         insts
     }
@@ -688,15 +830,17 @@ impl ABIMachineSpec for X64ABIMachineSpec {
     }
 
     fn get_virtual_sp_offset_from_state(s: &<Self::I as MachInstEmit>::State) -> i64 {
-        s.virtual_sp_offset
+        s.virtual_sp_offset()
     }
 
     fn get_nominal_sp_to_fp(s: &<Self::I as MachInstEmit>::State) -> i64 {
-        s.nominal_sp_to_fp
+        s.nominal_sp_to_fp()
     }
 
     fn get_regs_clobbered_by_call(call_conv_of_callee: isa::CallConv) -> PRegSet {
-        if call_conv_of_callee.extends_windows_fastcall() {
+        if call_conv_of_callee == isa::CallConv::Tail {
+            TAIL_CLOBBERS
+        } else if call_conv_of_callee.extends_windows_fastcall() {
             WINDOWS_CLOBBERS
         } else {
             SYSV_CLOBBERS
@@ -717,7 +861,9 @@ impl ABIMachineSpec for X64ABIMachineSpec {
         regs: &[Writable<RealReg>],
     ) -> Vec<Writable<RealReg>> {
         let mut regs: Vec<Writable<RealReg>> = match call_conv {
-            CallConv::Tail => unimplemented!(),
+            // The `tail` calling convention doesn't have any callee-save
+            // registers.
+            CallConv::Tail => vec![],
             CallConv::Fast | CallConv::Cold | CallConv::SystemV | CallConv::WasmtimeSystemV => regs
                 .iter()
                 .cloned()
@@ -786,6 +932,25 @@ impl From<StackAMode> for SyntheticAmode {
 fn get_intreg_for_arg(call_conv: &CallConv, idx: usize, arg_idx: usize) -> Option<Reg> {
     let is_fastcall = call_conv.extends_windows_fastcall();
 
+    if *call_conv == isa::CallConv::Tail {
+        return match idx {
+            0 => Some(regs::rax()),
+            1 => Some(regs::rcx()),
+            2 => Some(regs::rdx()),
+            3 => Some(regs::rbx()),
+            4 => Some(regs::rsi()),
+            5 => Some(regs::rdi()),
+            6 => Some(regs::r8()),
+            7 => Some(regs::r9()),
+            8 => Some(regs::r10()),
+            9 => Some(regs::r11()),
+            // NB: `r12`, `r13`, `r14` and `r15` are reserved for indirect
+            // callee addresses and temporaries required for our tail call
+            // sequence (fp, ret_addr, tmp).
+            _ => None,
+        };
+    }
+
     // Fastcall counts by absolute argument number; SysV counts by argument of
     // this (integer) class.
     let i = if is_fastcall { arg_idx } else { idx };
@@ -833,7 +998,23 @@ fn get_intreg_for_retval(
     retval_idx: usize,
 ) -> Option<Reg> {
     match call_conv {
-        CallConv::Tail => unimplemented!(),
+        CallConv::Tail => match intreg_idx {
+            0 => Some(regs::rax()),
+            1 => Some(regs::rcx()),
+            2 => Some(regs::rdx()),
+            3 => Some(regs::rbx()),
+            4 => Some(regs::rsi()),
+            5 => Some(regs::rdi()),
+            6 => Some(regs::r8()),
+            7 => Some(regs::r9()),
+            8 => Some(regs::r10()),
+            9 => Some(regs::r11()),
+            10 => Some(regs::r12()),
+            11 => Some(regs::r13()),
+            12 => Some(regs::r14()),
+            // NB: `r15` is reserved as a scratch register.
+            _ => None,
+        },
         CallConv::Fast | CallConv::Cold | CallConv::SystemV => match intreg_idx {
             0 => Some(regs::rax()),
             1 => Some(regs::rdx()),
@@ -862,7 +1043,17 @@ fn get_fltreg_for_retval(
     retval_idx: usize,
 ) -> Option<Reg> {
     match call_conv {
-        CallConv::Tail => unimplemented!(),
+        CallConv::Tail => match fltreg_idx {
+            0 => Some(regs::xmm0()),
+            1 => Some(regs::xmm1()),
+            2 => Some(regs::xmm2()),
+            3 => Some(regs::xmm3()),
+            4 => Some(regs::xmm4()),
+            5 => Some(regs::xmm5()),
+            6 => Some(regs::xmm6()),
+            7 => Some(regs::xmm7()),
+            _ => None,
+        },
         CallConv::Fast | CallConv::Cold | CallConv::SystemV => match fltreg_idx {
             0 => Some(regs::xmm0()),
             1 => Some(regs::xmm1()),
@@ -936,6 +1127,7 @@ fn compute_clobber_size(clobbers: &[Writable<RealReg>]) -> u32 {
 
 const WINDOWS_CLOBBERS: PRegSet = windows_clobbers();
 const SYSV_CLOBBERS: PRegSet = sysv_clobbers();
+const TAIL_CLOBBERS: PRegSet = tail_clobbers();
 
 const fn windows_clobbers() -> PRegSet {
     PRegSet::empty()
@@ -965,6 +1157,40 @@ const fn sysv_clobbers() -> PRegSet {
         .with(regs::gpr_preg(regs::ENC_R9))
         .with(regs::gpr_preg(regs::ENC_R10))
         .with(regs::gpr_preg(regs::ENC_R11))
+        .with(regs::fpr_preg(0))
+        .with(regs::fpr_preg(1))
+        .with(regs::fpr_preg(2))
+        .with(regs::fpr_preg(3))
+        .with(regs::fpr_preg(4))
+        .with(regs::fpr_preg(5))
+        .with(regs::fpr_preg(6))
+        .with(regs::fpr_preg(7))
+        .with(regs::fpr_preg(8))
+        .with(regs::fpr_preg(9))
+        .with(regs::fpr_preg(10))
+        .with(regs::fpr_preg(11))
+        .with(regs::fpr_preg(12))
+        .with(regs::fpr_preg(13))
+        .with(regs::fpr_preg(14))
+        .with(regs::fpr_preg(15))
+}
+
+const fn tail_clobbers() -> PRegSet {
+    PRegSet::empty()
+        .with(regs::gpr_preg(regs::ENC_RAX))
+        .with(regs::gpr_preg(regs::ENC_RCX))
+        .with(regs::gpr_preg(regs::ENC_RDX))
+        .with(regs::gpr_preg(regs::ENC_RBX))
+        .with(regs::gpr_preg(regs::ENC_RSI))
+        .with(regs::gpr_preg(regs::ENC_RDI))
+        .with(regs::gpr_preg(regs::ENC_R8))
+        .with(regs::gpr_preg(regs::ENC_R9))
+        .with(regs::gpr_preg(regs::ENC_R10))
+        .with(regs::gpr_preg(regs::ENC_R11))
+        .with(regs::gpr_preg(regs::ENC_R12))
+        .with(regs::gpr_preg(regs::ENC_R13))
+        .with(regs::gpr_preg(regs::ENC_R14))
+        .with(regs::gpr_preg(regs::ENC_R15))
         .with(regs::fpr_preg(0))
         .with(regs::fpr_preg(1))
         .with(regs::fpr_preg(2))

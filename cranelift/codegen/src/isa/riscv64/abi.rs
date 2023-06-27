@@ -103,11 +103,13 @@ impl ABIMachineSpec for Riscv64MachineDeps {
     {
         // All registers that can be used as parameters or rets.
         // both start and end are included.
-        let (x_start, x_end, f_start, f_end) = if args_or_rets == ArgsOrRets::Args {
-            (10, 17, 10, 17)
-        } else {
-            let end = if call_conv.extends_wasmtime() { 10 } else { 11 };
-            (10, end, 10, end)
+        let (x_start, x_end, f_start, f_end) = match (call_conv, args_or_rets) {
+            (isa::CallConv::Tail, _) => (9, 29, 0, 31),
+            (_, ArgsOrRets::Args) => (10, 17, 10, 17),
+            (_, ArgsOrRets::Rets) => {
+                let end = if call_conv.extends_wasmtime() { 10 } else { 11 };
+                (10, end, 10, end)
+            }
         };
         let mut next_x_reg = x_start;
         let mut next_f_reg = f_start;
@@ -215,13 +217,16 @@ impl ABIMachineSpec for Riscv64MachineDeps {
         } else {
             None
         };
+
         next_stack = align_to(next_stack, Self::stack_align(call_conv));
+
         // To avoid overflow issues, limit the arg/return size to something
         // reasonable -- here, 128 MB.
         if next_stack > STACK_ARG_RET_SIZE_LIMIT {
             return Err(CodegenError::ImplLimitExceeded);
         }
-        CodegenResult::Ok((next_stack, pos))
+
+        Ok((next_stack, pos))
     }
 
     fn fp_to_arg_offset(_call_conv: isa::CallConv, _flags: &settings::Flags) -> i64 {
@@ -269,8 +274,16 @@ impl ABIMachineSpec for Riscv64MachineDeps {
         Inst::Args { args }
     }
 
-    fn gen_ret(_setup_frame: bool, _isa_flags: &Self::F, rets: Vec<RetPair>) -> Inst {
-        Inst::Ret { rets }
+    fn gen_ret(
+        _setup_frame: bool,
+        _isa_flags: &Self::F,
+        rets: Vec<RetPair>,
+        stack_bytes_to_pop: u32,
+    ) -> Inst {
+        Inst::Ret {
+            rets,
+            stack_bytes_to_pop,
+        }
     }
 
     fn get_stacklimit_reg() -> Reg {
@@ -335,7 +348,7 @@ impl ABIMachineSpec for Riscv64MachineDeps {
         if amount == 0 {
             return insts;
         }
-        insts.push(Inst::AjustSp {
+        insts.push(Inst::AdjustSp {
             amount: amount as i64,
         });
         insts
@@ -353,7 +366,7 @@ impl ABIMachineSpec for Riscv64MachineDeps {
         // sd   fp,0(sp)     ;; store old fp.
         // mv   fp,sp        ;; set fp to sp.
         let mut insts = SmallVec::new();
-        insts.push(Inst::AjustSp { amount: -16 });
+        insts.push(Inst::AdjustSp { amount: -16 });
         insts.push(Self::gen_store_stack(
             StackAMode::SPOffset(8, I64),
             link_reg(),
@@ -391,7 +404,7 @@ impl ABIMachineSpec for Riscv64MachineDeps {
             writable_fp_reg(),
             I64,
         ));
-        insts.push(Inst::AjustSp { amount: 16 });
+        insts.push(Inst::AdjustSp { amount: 16 });
         insts
     }
 
@@ -413,6 +426,7 @@ impl ABIMachineSpec for Riscv64MachineDeps {
                 opcode: Opcode::Call,
                 callee_callconv: CallConv::SystemV,
                 caller_callconv: CallConv::SystemV,
+                callee_pop_size: 0,
             }),
         });
     }
@@ -468,7 +482,7 @@ impl ABIMachineSpec for Riscv64MachineDeps {
                 ));
                 cur_offset += 8
             }
-            insts.push(Inst::AjustSp {
+            insts.push(Inst::AdjustSp {
                 amount: -(stack_size as i64),
             });
         }
@@ -488,7 +502,7 @@ impl ABIMachineSpec for Riscv64MachineDeps {
             Self::get_clobbered_callee_saves(call_conv, _flags, sig, clobbers);
         let stack_size = fixed_frame_storage_size + compute_clobber_size(&clobbered_callee_saves);
         if stack_size > 0 {
-            insts.push(Inst::AjustSp {
+            insts.push(Inst::AdjustSp {
                 amount: stack_size as i64,
             });
         }
@@ -519,6 +533,7 @@ impl ABIMachineSpec for Riscv64MachineDeps {
         tmp: Writable<Reg>,
         callee_conv: isa::CallConv,
         caller_conv: isa::CallConv,
+        callee_pop_size: u32,
     ) -> SmallVec<[Self::I; 2]> {
         let mut insts = SmallVec::new();
         match &dest {
@@ -531,6 +546,7 @@ impl ABIMachineSpec for Riscv64MachineDeps {
                     opcode,
                     caller_callconv: caller_conv,
                     callee_callconv: callee_conv,
+                    callee_pop_size,
                 }),
             }),
             &CallDest::ExtName(ref name, RelocDistance::Far) => {
@@ -548,6 +564,7 @@ impl ABIMachineSpec for Riscv64MachineDeps {
                         opcode,
                         caller_callconv: caller_conv,
                         callee_callconv: callee_conv,
+                        callee_pop_size,
                     }),
                 });
             }
@@ -560,10 +577,24 @@ impl ABIMachineSpec for Riscv64MachineDeps {
                     opcode,
                     caller_callconv: caller_conv,
                     callee_callconv: callee_conv,
+                    callee_pop_size,
                 }),
             }),
         }
         insts
+    }
+
+    fn gen_return_call(
+        _callee: CallDest,
+        _new_stack_arg_size: u32,
+        _old_stack_arg_size: u32,
+        _ret_addr: Option<Reg>,
+        _fp: Reg,
+        _tmp: Writable<Reg>,
+        _tmp2: Writable<Reg>,
+        _uses: abi::CallArgList,
+    ) -> SmallVec<[Self::I; 2]> {
+        todo!();
     }
 
     fn gen_memcpy<F: FnMut(Type) -> Writable<Reg>>(
@@ -601,6 +632,7 @@ impl ABIMachineSpec for Riscv64MachineDeps {
                 opcode: Opcode::Call,
                 caller_callconv: call_conv,
                 callee_callconv: call_conv,
+                callee_pop_size: 0,
             }),
         });
         insts
@@ -629,8 +661,12 @@ impl ABIMachineSpec for Riscv64MachineDeps {
         s.nominal_sp_to_fp
     }
 
-    fn get_regs_clobbered_by_call(_call_conv_of_callee: isa::CallConv) -> PRegSet {
-        CLOBBERS
+    fn get_regs_clobbered_by_call(call_conv_of_callee: isa::CallConv) -> PRegSet {
+        if call_conv_of_callee == isa::CallConv::Tail {
+            TAIL_CLOBBERS
+        } else {
+            DEFAULT_CLOBBERS
+        }
     }
 
     fn get_clobbered_callee_saves(
@@ -663,7 +699,12 @@ impl ABIMachineSpec for Riscv64MachineDeps {
         || fixed_frame_storage_size > 0
     }
 
-    fn gen_inline_probestack(insts: &mut SmallInstVec<Self::I>, frame_size: u32, guard_size: u32) {
+    fn gen_inline_probestack(
+        insts: &mut SmallInstVec<Self::I>,
+        call_conv: isa::CallConv,
+        frame_size: u32,
+        guard_size: u32,
+    ) {
         // Unroll at most n consecutive probes, before falling back to using a loop
         const PROBE_MAX_UNROLL: u32 = 3;
         // Number of probes that we need to perform
@@ -672,7 +713,7 @@ impl ABIMachineSpec for Riscv64MachineDeps {
         if probe_count <= PROBE_MAX_UNROLL {
             Self::gen_probestack_unroll(insts, guard_size, probe_count)
         } else {
-            Self::gen_probestack_loop(insts, guard_size, probe_count)
+            Self::gen_probestack_loop(insts, call_conv, guard_size, probe_count)
         }
     }
 }
@@ -692,7 +733,11 @@ const CALLEE_SAVE_F_REG: [bool; 32] = [
 
 /// This should be the registers that must be saved by callee.
 #[inline]
-fn is_reg_saved_in_prologue(_conv: CallConv, reg: RealReg) -> bool {
+fn is_reg_saved_in_prologue(conv: CallConv, reg: RealReg) -> bool {
+    if conv == CallConv::Tail {
+        return false;
+    }
+
     match reg.class() {
         RegClass::Int => CALLEE_SAVE_X_REG[reg.hw_enc() as usize],
         RegClass::Float => CALLEE_SAVE_F_REG[reg.hw_enc() as usize],
@@ -717,7 +762,7 @@ fn compute_clobber_size(clobbers: &[Writable<RealReg>]) -> u32 {
     align_to(clobbered_size, 16)
 }
 
-const fn clobbers() -> PRegSet {
+const fn default_clobbers() -> PRegSet {
     PRegSet::empty()
         .with(px_reg(1))
         .with(px_reg(5))
@@ -792,7 +837,113 @@ const fn clobbers() -> PRegSet {
         .with(pv_reg(31))
 }
 
-const CLOBBERS: PRegSet = clobbers();
+const DEFAULT_CLOBBERS: PRegSet = default_clobbers();
+
+// All allocatable registers are clobbered by calls using the `tail` calling
+// convention.
+const fn tail_clobbers() -> PRegSet {
+    PRegSet::empty()
+        // `x0` is the zero register, and not allocatable.
+        .with(px_reg(1))
+        // `x2` is the stack pointer, `x3` is the global pointer, and `x4` is
+        // the thread pointer. None are allocatable.
+        .with(px_reg(5))
+        .with(px_reg(6))
+        .with(px_reg(7))
+        // `x8` is the frame pointer, and not allocatable.
+        .with(px_reg(9))
+        .with(px_reg(10))
+        .with(px_reg(10))
+        .with(px_reg(11))
+        .with(px_reg(12))
+        .with(px_reg(13))
+        .with(px_reg(14))
+        .with(px_reg(15))
+        .with(px_reg(16))
+        .with(px_reg(17))
+        .with(px_reg(18))
+        .with(px_reg(19))
+        .with(px_reg(20))
+        .with(px_reg(21))
+        .with(px_reg(22))
+        .with(px_reg(23))
+        .with(px_reg(24))
+        .with(px_reg(25))
+        .with(px_reg(26))
+        .with(px_reg(27))
+        .with(px_reg(28))
+        .with(px_reg(29))
+        // `x30` and `x31` are reserved as scratch registers, and are not
+        // allocatable.
+        //
+        // F Regs
+        .with(pf_reg(0))
+        .with(pf_reg(1))
+        .with(pf_reg(2))
+        .with(pf_reg(3))
+        .with(pf_reg(4))
+        .with(pf_reg(5))
+        .with(pf_reg(6))
+        .with(pf_reg(7))
+        .with(pf_reg(9))
+        .with(pf_reg(10))
+        .with(pf_reg(11))
+        .with(pf_reg(12))
+        .with(pf_reg(13))
+        .with(pf_reg(14))
+        .with(pf_reg(15))
+        .with(pf_reg(16))
+        .with(pf_reg(17))
+        .with(pf_reg(18))
+        .with(pf_reg(19))
+        .with(pf_reg(20))
+        .with(pf_reg(21))
+        .with(pf_reg(22))
+        .with(pf_reg(23))
+        .with(pf_reg(24))
+        .with(pf_reg(25))
+        .with(pf_reg(26))
+        .with(pf_reg(27))
+        .with(pf_reg(28))
+        .with(pf_reg(29))
+        .with(pf_reg(30))
+        .with(pf_reg(31))
+        // V Regs
+        .with(pv_reg(0))
+        .with(pv_reg(1))
+        .with(pv_reg(2))
+        .with(pv_reg(3))
+        .with(pv_reg(4))
+        .with(pv_reg(5))
+        .with(pv_reg(6))
+        .with(pv_reg(7))
+        .with(pv_reg(8))
+        .with(pv_reg(9))
+        .with(pv_reg(10))
+        .with(pv_reg(11))
+        .with(pv_reg(12))
+        .with(pv_reg(13))
+        .with(pv_reg(14))
+        .with(pv_reg(15))
+        .with(pv_reg(16))
+        .with(pv_reg(17))
+        .with(pv_reg(18))
+        .with(pv_reg(19))
+        .with(pv_reg(20))
+        .with(pv_reg(21))
+        .with(pv_reg(22))
+        .with(pv_reg(23))
+        .with(pv_reg(24))
+        .with(pv_reg(25))
+        .with(pv_reg(26))
+        .with(pv_reg(27))
+        .with(pv_reg(28))
+        .with(pv_reg(29))
+        .with(pv_reg(30))
+        .with(pv_reg(31))
+}
+
+const TAIL_CLOBBERS: PRegSet = tail_clobbers();
 
 impl Riscv64MachineDeps {
     fn gen_probestack_unroll(insts: &mut SmallInstVec<Inst>, guard_size: u32, probe_count: u32) {
@@ -807,11 +958,21 @@ impl Riscv64MachineDeps {
         }
     }
 
-    fn gen_probestack_loop(insts: &mut SmallInstVec<Inst>, guard_size: u32, probe_count: u32) {
+    fn gen_probestack_loop(
+        insts: &mut SmallInstVec<Inst>,
+        call_conv: isa::CallConv,
+        guard_size: u32,
+        probe_count: u32,
+    ) {
+        // Must be a caller-saved register that is not an argument.
+        let tmp = match call_conv {
+            isa::CallConv::Tail => Writable::from_reg(x_reg(1)),
+            _ => Writable::from_reg(x_reg(28)), // t3
+        };
         insts.push(Inst::StackProbeLoop {
             guard_size,
             probe_count,
-            tmp: Writable::from_reg(x_reg(28)), // t3
+            tmp,
         });
     }
 }

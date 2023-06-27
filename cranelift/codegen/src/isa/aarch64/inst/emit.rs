@@ -3114,10 +3114,32 @@ impl MachInstEmit for Inst {
                 // Nothing: this is a pseudoinstruction that serves
                 // only to constrain registers at a certain point.
             }
-            &Inst::Ret { .. } => {
+            &Inst::Ret {
+                stack_bytes_to_pop, ..
+            } => {
+                if stack_bytes_to_pop != 0 {
+                    // The requirement that `stack_bytes_to_pop` fit in an
+                    // `Imm12` isn't fundamental, but lifting it is left for
+                    // future PRs.
+                    let imm12 = Imm12::maybe_from_u64(u64::from(stack_bytes_to_pop))
+                        .expect("stack bytes to pop must fit in Imm12");
+                    Inst::AluRRImm12 {
+                        alu_op: ALUOp::Add,
+                        size: OperandSize::Size64,
+                        rd: writable_stack_reg(),
+                        rn: stack_reg(),
+                        imm12,
+                    }
+                    .emit(&[], sink, emit_info, state);
+                }
                 sink.put4(0xd65f03c0);
             }
-            &Inst::AuthenticatedRet { key, is_hint, .. } => {
+            &Inst::AuthenticatedRet {
+                key,
+                is_hint,
+                stack_bytes_to_pop,
+                ..
+            } => {
                 let key = match key {
                     APIKey::A => 0b0,
                     APIKey::B => 0b1,
@@ -3125,8 +3147,27 @@ impl MachInstEmit for Inst {
 
                 if is_hint {
                     sink.put4(0xd50323bf | key << 6); // autiasp / autibsp
-                    Inst::Ret { rets: vec![] }.emit(&[], sink, emit_info, state);
+                    Inst::Ret {
+                        rets: vec![],
+                        stack_bytes_to_pop,
+                    }
+                    .emit(&[], sink, emit_info, state);
                 } else {
+                    if stack_bytes_to_pop != 0 {
+                        // The requirement that `stack_bytes_to_pop` fit in an
+                        // `Imm12` isn't fundamental, but lifting it is left for
+                        // future PRs.
+                        let imm12 = Imm12::maybe_from_u64(u64::from(stack_bytes_to_pop))
+                            .expect("stack bytes to pop must fit in Imm12");
+                        Inst::AluRRImm12 {
+                            alu_op: ALUOp::Add,
+                            size: OperandSize::Size64,
+                            rd: writable_stack_reg(),
+                            rn: stack_reg(),
+                            imm12,
+                        }
+                        .emit(&[], sink, emit_info, state);
+                    }
                     sink.put4(0xd65f0bff | key << 10); // retaa / retab
                 }
             }
@@ -3139,6 +3180,13 @@ impl MachInstEmit for Inst {
                 if info.opcode.is_call() {
                     sink.add_call_site(info.opcode);
                 }
+
+                let callee_pop_size = i64::from(info.callee_pop_size);
+                state.virtual_sp_offset -= callee_pop_size;
+                trace!(
+                    "call adjusts virtual sp offset by {callee_pop_size} -> {}",
+                    state.virtual_sp_offset
+                );
             }
             &Inst::CallInd { ref info } => {
                 if let Some(s) = state.take_stack_map() {
@@ -3149,6 +3197,13 @@ impl MachInstEmit for Inst {
                 if info.opcode.is_call() {
                     sink.add_call_site(info.opcode);
                 }
+
+                let callee_pop_size = i64::from(info.callee_pop_size);
+                state.virtual_sp_offset -= callee_pop_size;
+                trace!(
+                    "call adjusts virtual sp offset by {callee_pop_size} -> {}",
+                    state.virtual_sp_offset
+                );
             }
             &Inst::CondBr {
                 taken,
@@ -3561,6 +3616,7 @@ impl MachInstEmit for Inst {
                         opcode: Opcode::CallIndirect,
                         caller_callconv: CallConv::AppleAarch64,
                         callee_callconv: CallConv::AppleAarch64,
+                        callee_pop_size: 0,
                     }),
                 }
                 .emit(&[], sink, emit_info, state);

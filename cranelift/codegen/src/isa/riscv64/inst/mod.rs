@@ -20,6 +20,7 @@ use alloc::vec::Vec;
 use regalloc2::{PRegSet, RegClass, VReg};
 use smallvec::{smallvec, SmallVec};
 use std::boxed::Box;
+use std::fmt::Write;
 use std::string::{String, ToString};
 
 pub mod regs;
@@ -57,7 +58,7 @@ pub use crate::isa::riscv64::lower::isle::generated_code::{
     AluOPRRI, AluOPRRR, AtomicOP, FClassResult, FFlagsException, FloatRoundOP, FloatSelectOP,
     FpuOPRR, FpuOPRRR, FpuOPRRRR, IntSelectOP, LoadOP, MInst as Inst, StoreOP, FRM,
 };
-use crate::isa::riscv64::lower::isle::generated_code::{MInst, VecAluOpRRR};
+use crate::isa::riscv64::lower::isle::generated_code::{MInst, VecAluOpRRImm5, VecAluOpRRR};
 
 type BoxCallInfo = Box<CallInfo>;
 type BoxCallIndInfo = Box<CallIndInfo>;
@@ -73,6 +74,7 @@ pub struct CallInfo {
     pub caller_callconv: CallConv,
     pub callee_callconv: CallConv,
     pub clobbers: PRegSet,
+    pub callee_pop_size: u32,
 }
 
 /// Additional information for CallInd instructions, left out of line to lower the size of the Inst
@@ -86,6 +88,7 @@ pub struct CallIndInfo {
     pub caller_callconv: CallConv,
     pub callee_callconv: CallConv,
     pub clobbers: PRegSet,
+    pub callee_pop_size: u32,
 }
 
 /// A branch target. Either unresolved (basic-block index) or resolved (offset
@@ -349,6 +352,17 @@ fn vec_mask_operands<F: Fn(VReg) -> VReg>(
         VecOpMasking::Disabled => {}
     }
 }
+fn vec_mask_late_operands<F: Fn(VReg) -> VReg>(
+    mask: &VecOpMasking,
+    collector: &mut OperandCollector<'_, F>,
+) {
+    match mask {
+        VecOpMasking::Enabled { reg } => {
+            collector.reg_fixed_late_use(*reg, pv_reg(0).into());
+        }
+        VecOpMasking::Disabled => {}
+    }
+}
 
 fn riscv64_get_operands<F: Fn(VReg) -> VReg>(inst: &Inst, collector: &mut OperandCollector<'_, F>) {
     match inst {
@@ -397,7 +411,7 @@ fn riscv64_get_operands<F: Fn(VReg) -> VReg>(inst: &Inst, collector: &mut Operan
                 collector.reg_fixed_def(arg.vreg, arg.preg);
             }
         }
-        &Inst::Ret { ref rets } => {
+        &Inst::Ret { ref rets, .. } => {
             for ret in rets {
                 collector.reg_fixed_use(ret.vreg, ret.preg);
             }
@@ -407,7 +421,7 @@ fn riscv64_get_operands<F: Fn(VReg) -> VReg>(inst: &Inst, collector: &mut Operan
             collector.reg_use(rn);
             collector.reg_def(rd);
         }
-        &Inst::AjustSp { .. } => {}
+        &Inst::AdjustSp { .. } => {}
         &Inst::Call { ref info } => {
             for u in &info.uses {
                 collector.reg_fixed_use(u.vreg, u.preg);
@@ -418,7 +432,14 @@ fn riscv64_get_operands<F: Fn(VReg) -> VReg>(inst: &Inst, collector: &mut Operan
             collector.reg_clobbers(info.clobbers);
         }
         &Inst::CallInd { ref info } => {
-            collector.reg_use(info.rn);
+            if info.callee_callconv == CallConv::Tail {
+                // TODO(https://github.com/bytecodealliance/regalloc2/issues/145):
+                // This shouldn't be a fixed register constraint.
+                collector.reg_fixed_use(info.rn, x_reg(5));
+            } else {
+                collector.reg_use(info.rn);
+            }
+
             for u in &info.uses {
                 collector.reg_fixed_use(u.vreg, u.preg);
             }
@@ -639,6 +660,32 @@ fn riscv64_get_operands<F: Fn(VReg) -> VReg>(inst: &Inst, collector: &mut Operan
             // gen_prologue is called at emit stage.
             // no need let reg alloc know.
         }
+        &Inst::VecAluRRRImm5 {
+            op,
+            vd,
+            vd_src,
+            vs2,
+            ref mask,
+            ..
+        } => {
+            debug_assert_eq!(vd_src.class(), RegClass::Vector);
+            debug_assert_eq!(vd.to_reg().class(), RegClass::Vector);
+            debug_assert_eq!(vs2.class(), RegClass::Vector);
+
+            // If the operation forbids source/destination overlap we need to
+            // ensure that the source and destination registers are different.
+            if op.forbids_src_dst_overlaps() {
+                collector.reg_late_use(vs2);
+                collector.reg_use(vd_src);
+                collector.reg_reuse_def(vd, 1); // `vd` == `vd_src`.
+                vec_mask_late_operands(mask, collector);
+            } else {
+                collector.reg_use(vs2);
+                collector.reg_use(vd_src);
+                collector.reg_reuse_def(vd, 1); // `vd` == `vd_src`.
+                vec_mask_operands(mask, collector);
+            }
+        }
         &Inst::VecAluRRR {
             op,
             vd,
@@ -653,17 +700,39 @@ fn riscv64_get_operands<F: Fn(VReg) -> VReg>(inst: &Inst, collector: &mut Operan
 
             collector.reg_use(vs1);
             collector.reg_use(vs2);
-            collector.reg_def(vd);
+
+            // If the operation forbids source/destination overlap, then we must
+            // register it as an early_def. This encodes the constraint that
+            // these must not overlap.
+            if op.forbids_src_dst_overlaps() {
+                collector.reg_early_def(vd);
+            } else {
+                collector.reg_def(vd);
+            }
+
             vec_mask_operands(mask, collector);
         }
         &Inst::VecAluRRImm5 {
-            vd, vs2, ref mask, ..
+            op,
+            vd,
+            vs2,
+            ref mask,
+            ..
         } => {
             debug_assert_eq!(vd.to_reg().class(), RegClass::Vector);
             debug_assert_eq!(vs2.class(), RegClass::Vector);
 
             collector.reg_use(vs2);
-            collector.reg_def(vd);
+
+            // If the operation forbids source/destination overlap, then we must
+            // register it as an early_def. This encodes the constraint that
+            // these must not overlap.
+            if op.forbids_src_dst_overlaps() {
+                collector.reg_early_def(vd);
+            } else {
+                collector.reg_def(vd);
+            }
+
             vec_mask_operands(mask, collector);
         }
         &Inst::VecAluRR {
@@ -677,7 +746,16 @@ fn riscv64_get_operands<F: Fn(VReg) -> VReg>(inst: &Inst, collector: &mut Operan
             debug_assert_eq!(vs.class(), op.src_regclass());
 
             collector.reg_use(vs);
-            collector.reg_def(vd);
+
+            // If the operation forbids source/destination overlap, then we must
+            // register it as an early_def. This encodes the constraint that
+            // these must not overlap.
+            if op.forbids_src_dst_overlaps() {
+                collector.reg_early_def(vd);
+            } else {
+                collector.reg_def(vd);
+            }
+
             vec_mask_operands(mask, collector);
         }
         &Inst::VecAluRImm5 { vd, ref mask, .. } => {
@@ -1288,8 +1366,6 @@ impl Inst {
                 format!("{} {},{}", "lui", format_reg(rd.to_reg(), allocs), imm.bits)
             }
             &Inst::LoadConst32 { rd, imm } => {
-                use std::fmt::Write;
-
                 let rd = format_reg(rd.to_reg(), allocs);
                 let mut buf = String::new();
                 write!(&mut buf, "auipc {},0; ", rd).unwrap();
@@ -1299,8 +1375,6 @@ impl Inst {
                 buf
             }
             &Inst::LoadConst64 { rd, imm } => {
-                use std::fmt::Write;
-
                 let rd = format_reg(rd.to_reg(), allocs);
                 let mut buf = String::new();
                 write!(&mut buf, "auipc {},0; ", rd).unwrap();
@@ -1459,21 +1533,27 @@ impl Inst {
                 let mut s = "args".to_string();
                 let mut empty_allocs = AllocationConsumer::default();
                 for arg in args {
-                    use std::fmt::Write;
                     let preg = format_reg(arg.preg, &mut empty_allocs);
                     let def = format_reg(arg.vreg.to_reg(), allocs);
                     write!(&mut s, " {}={}", def, preg).unwrap();
                 }
                 s
             }
-            &Inst::Ret { ref rets } => {
-                let mut s = "ret".to_string();
+            &Inst::Ret {
+                ref rets,
+                stack_bytes_to_pop,
+            } => {
+                let mut s = if stack_bytes_to_pop == 0 {
+                    "ret".to_string()
+                } else {
+                    format!("add sp, sp, #{stack_bytes_to_pop} ; ret")
+                };
+
                 let mut empty_allocs = AllocationConsumer::default();
                 for ret in rets {
-                    use std::fmt::Write;
                     let preg = format_reg(ret.preg, &mut empty_allocs);
                     let vreg = format_reg(ret.vreg, allocs);
-                    write!(&mut s, " {}={}", vreg, preg).unwrap();
+                    write!(&mut s, " {vreg}={preg}").unwrap();
                 }
                 s
             }
@@ -1495,7 +1575,7 @@ impl Inst {
                     format!("slli {rd},{rn},{shift_bits}; {op} {rd},{rd},{shift_bits}")
                 };
             }
-            &MInst::AjustSp { amount } => {
+            &MInst::AdjustSp { amount } => {
                 format!("{} sp,{:+}", "add", amount)
             }
             &MInst::Call { ref info } => format!("call {}", info.dest.display(None)),
@@ -1578,14 +1658,15 @@ impl Inst {
             &MInst::Mov { rd, rm, ty } => {
                 let rd = format_reg(rd.to_reg(), allocs);
                 let rm = format_reg(rm, allocs);
-                let v = if ty == F32 {
-                    "fmv.s"
-                } else if ty == F64 {
-                    "fmv.d"
-                } else {
-                    "mv"
+
+                let op = match ty {
+                    F32 => "fmv.s",
+                    F64 => "fmv.d",
+                    ty if ty.is_vector() => "vmv1r.v",
+                    _ => "mv",
                 };
-                format!("{} {},{}", v, rd, rm)
+
+                format!("{op} {rd},{rm}")
             }
             &MInst::MovFromPReg { rd, rm } => {
                 let rd = format_reg(rd.to_reg(), allocs);
@@ -1618,6 +1699,29 @@ impl Inst {
             &MInst::Udf { trap_code } => format!("udf##trap_code={}", trap_code),
             &MInst::EBreak {} => String::from("ebreak"),
             &MInst::ECall {} => String::from("ecall"),
+            &Inst::VecAluRRRImm5 {
+                op,
+                vd,
+                imm,
+                vs2,
+                ref mask,
+                ref vstate,
+                ..
+            } => {
+                let vs2_s = format_reg(vs2, allocs);
+                let vd_s = format_reg(vd.to_reg(), allocs);
+                let mask = format_mask(mask, allocs);
+
+                // Some opcodes interpret the immediate as unsigned, lets show the
+                // correct number here.
+                let imm_s = if op.imm_is_unsigned() {
+                    format!("{}", imm.bits())
+                } else {
+                    format!("{}", imm)
+                };
+
+                format!("{op} {vd_s},{vs2_s},{imm_s}{mask} {vstate}")
+            }
             &Inst::VecAluRRR {
                 op,
                 vd,
@@ -1639,6 +1743,9 @@ impl Inst {
                     }
                     (VecAluOpRRR::VfsgnjnVV, vs2, vs1) if vs2 == vs1 => {
                         format!("vfneg.v {vd_s},{vs2_s}{mask} {vstate}")
+                    }
+                    (VecAluOpRRR::VmnandMM, vs2, vs1) if vs2 == vs1 => {
+                        format!("vmnot.m {vd_s},{vs2_s}{mask} {vstate}")
                     }
                     _ => format!("{op} {vd_s},{vs2_s},{vs1_s}{mask} {vstate}"),
                 }
@@ -1663,7 +1770,12 @@ impl Inst {
                     format!("{}", imm)
                 };
 
-                format!("{op} {vd_s},{vs2_s},{imm_s}{mask} {vstate}")
+                match (op, imm) {
+                    (VecAluOpRRImm5::VxorVI, imm) if imm == Imm5::maybe_from_i8(-1).unwrap() => {
+                        format!("vnot.v {vd_s},{vs2_s}{mask} {vstate}")
+                    }
+                    _ => format!("{op} {vd_s},{vs2_s},{imm_s}{mask} {vstate}"),
+                }
             }
             &Inst::VecAluRR {
                 op,

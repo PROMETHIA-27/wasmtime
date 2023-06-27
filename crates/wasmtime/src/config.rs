@@ -68,6 +68,16 @@ impl Default for ModuleVersionStrategy {
     }
 }
 
+impl std::hash::Hash for ModuleVersionStrategy {
+    fn hash<H: std::hash::Hasher>(&self, hasher: &mut H) {
+        match self {
+            Self::WasmtimeVersion => env!("CARGO_PKG_VERSION").hash(hasher),
+            Self::Custom(s) => s.hash(hasher),
+            Self::None => {}
+        };
+    }
+}
+
 /// Global configuration options used to create an [`Engine`](crate::Engine)
 /// and customize its behavior.
 ///
@@ -660,6 +670,22 @@ impl Config {
     /// [proposal]: https://github.com/webassembly/reference-types
     pub fn wasm_reference_types(&mut self, enable: bool) -> &mut Self {
         self.features.reference_types = enable;
+        self
+    }
+
+    /// Configures whether the [WebAssembly function references proposal][proposal]
+    /// will be enabled for compilation.
+    ///
+    /// This feature gates non-nullable reference types, function reference
+    /// types, call_ref, ref.func, and non-nullable reference related instructions.
+    ///
+    /// Note that the function references proposal depends on the reference types proposal.
+    ///
+    /// This feature is `false` by default.
+    ///
+    /// [proposal]: https://github.com/WebAssembly/function-references
+    pub fn wasm_function_references(&mut self, enable: bool) -> &mut Self {
+        self.features.function_references = enable;
         self
     }
 
@@ -1594,14 +1620,6 @@ impl Config {
                 bail!("compiler option 'enable_safepoints' must be enabled when 'reference types' is enabled");
             }
         }
-        if self.features.simd {
-            if !self
-                .compiler_config
-                .ensure_setting_unset_or_given("enable_simd", "true")
-            {
-                bail!("compiler option 'enable_simd' must be enabled when 'simd' is enabled");
-            }
-        }
 
         if self.features.relaxed_simd && !self.features.simd {
             bail!("cannot disable the simd proposal but enable the relaxed simd proposal");
@@ -1659,6 +1677,10 @@ impl fmt::Debug for Config {
             .field("parse_wasm_debuginfo", &self.tunables.parse_wasm_debuginfo)
             .field("wasm_threads", &self.features.threads)
             .field("wasm_reference_types", &self.features.reference_types)
+            .field(
+                "wasm_function_references",
+                &self.features.function_references,
+            )
             .field("wasm_bulk_memory", &self.features.bulk_memory)
             .field("wasm_simd", &self.features.simd)
             .field("wasm_relaxed_simd", &self.features.relaxed_simd)

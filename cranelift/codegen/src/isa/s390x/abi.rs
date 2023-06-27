@@ -232,6 +232,12 @@ impl ABIMachineSpec for S390xMachineDeps {
     where
         I: IntoIterator<Item = &'a ir::AbiParam>,
     {
+        assert_ne!(
+            call_conv,
+            isa::CallConv::Tail,
+            "s390x does not support the 'tail' calling convention yet"
+        );
+
         let mut next_gpr = 0;
         let mut next_fpr = 0;
         let mut next_vr = 0;
@@ -456,10 +462,16 @@ impl ABIMachineSpec for S390xMachineDeps {
         Inst::Args { args }
     }
 
-    fn gen_ret(_setup_frame: bool, _isa_flags: &s390x_settings::Flags, rets: Vec<RetPair>) -> Inst {
+    fn gen_ret(
+        _setup_frame: bool,
+        _isa_flags: &s390x_settings::Flags,
+        rets: Vec<RetPair>,
+        stack_bytes_to_pop: u32,
+    ) -> Inst {
         Inst::Ret {
             link: gpr(14),
             rets,
+            stack_bytes_to_pop,
         }
     }
 
@@ -576,6 +588,7 @@ impl ABIMachineSpec for S390xMachineDeps {
 
     fn gen_inline_probestack(
         _insts: &mut SmallInstVec<Self::I>,
+        _call_conv: isa::CallConv,
         _frame_size: u32,
         _guard_size: u32,
     ) {
@@ -747,8 +760,22 @@ impl ABIMachineSpec for S390xMachineDeps {
         _tmp: Writable<Reg>,
         _callee_conv: isa::CallConv,
         _caller_conv: isa::CallConv,
+        _callee_pop_size: u32,
     ) -> SmallVec<[Inst; 2]> {
         unreachable!();
+    }
+
+    fn gen_return_call(
+        _callee: CallDest,
+        _new_stack_arg_size: u32,
+        _old_stack_arg_size: u32,
+        _ret_addr: Option<Reg>,
+        _fp: Reg,
+        _tmp: Writable<Reg>,
+        _tmp2: Writable<Reg>,
+        _uses: abi::CallArgList,
+    ) -> SmallVec<[Self::I; 2]> {
+        todo!();
     }
 
     fn gen_memcpy<F: FnMut(Type) -> Writable<Reg>>(
