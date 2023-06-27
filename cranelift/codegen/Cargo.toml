@@ -38,6 +38,8 @@ sha2 = { version = "0.10.2", optional = true }
 [dev-dependencies]
 criterion = { version = "0.4.0", features = ["html_reports"] }
 similar = "2.1.0"
+cranelift-jit = { workspace = true }
+cranelift-module = { workspace = true }
 
 [build-dependencies]
 cranelift-codegen-meta = { path = "meta", version = "0.97.0" }
@@ -113,4 +115,8 @@ isle-in-source-tree = []
 
 [[bench]]
 name = "x64-evex-encoding"
+harness = false
+
+[[bench]]
+name = "factorial"
 harness = false
